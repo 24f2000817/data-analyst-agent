@@ -5,157 +5,124 @@ import json
 import pandas as pd
 import matplotlib.pyplot as plt
 import io
-import re
 import os
-from typing import Optional, List, Dict, Union
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+import requests
+import numpy as np
+from typing import Optional, List, Any
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
 from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
-import duckdb
-from openai import OpenAI
-from bs4 import BeautifulSoup
-import io
-import pandas as pd
-from langchain_core.tools import tool
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_core.exceptions import OutputParserException
+from langchain_core.agents import AgentAction, AgentFinish
 
 app = FastAPI()
 
 # --- Agent Tools ---
-# Read the API key from the environment variable
-openai_api_key = os.environ.get("OPENAI_API_KEY")
 
-# Check if the API key was found
-if not openai_api_key:
-    raise ValueError("The OPENAI_API_KEY environment variable is not set.")
+groq_api_key = os.environ.get("GROQ_API_KEY")
+if not groq_api_key:
+    raise ValueError("The GROQ_API_KEY environment variable is not set.")
 
-client = OpenAI(api_key=openai_api_key)
+# A global variable to hold the final answers, bypassing the agent's final text output.
+final_answers_container = None
 
 @tool
-def get_data_from_url(url: str) -> str:
-    """Scrapes data from a given URL and returns it as a string.
-    The agent should then use another tool to parse this string into a DataFrame."""
-    try:
-        # A more robust web scraping tool would go here, e.g., with BeautifulSoup
-        return f"Scraped data from {url}" # Placeholder
-    except Exception as e:
-        return f"Error scraping URL: {e}"
-    
-@tool
-def parse_html_table(html_string: str) -> str:
+def scrape_and_parse_url(url: str) -> str:
     """
-    Parses an HTML string to find tables and returns the first table as a JSON string.
-    This tool should be used after getting HTML content from a URL.
+    Scrapes a webpage, finds the first HTML table, and returns its content as a JSON string.
+    This tool should be used for data analysis tasks that require data from a web page.
     """
     try:
-        # Use BeautifulSoup with the built-in 'html.parser'
-        soup = BeautifulSoup(html_string, 'html.parser')
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+
+        try:
+            df_list = pd.read_html(response.content, flavor='lxml')
+        except ImportError:
+            return "Error: Missing dependency 'lxml'. Please install it using 'pip install lxml'."
         
-        table = soup.find('table')
+        if not df_list:
+            return "No tables were found on the web page."
+
+        df = df_list[0]
+        df.columns = [col.replace(" ", "_").replace("$", "").replace(",", "") for col in df.columns]
         
-        if table:
-            headers = [th.text.strip() for th in table.find_all('th')]
-            data = []
-            
-            for row in table.find_all('tr'):
-                cells = [cell.text.strip() for cell in row.find_all('td')]
-                if cells:  # Only append rows that contain data
-                    data.append(cells)
-            
-            # Create the DataFrame manually from the parsed data
-            df = pd.DataFrame(data, columns=headers)
-            return df.to_json(orient='records')
-        else:
-            return "No tables were found in the HTML string."
+        for col in ['Worldwide_gross', 'Rank', 'Peak', 'Year']:
+            if col in df.columns:
+                df[col] = df[col].astype(str)
+                df[col] = df[col].str.replace(r'[^\d.]', '', regex=True)
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        df.dropna(inplace=True)
+        return df.to_json(orient='records')
+    except requests.exceptions.RequestException as e:
+        return f"Error fetching URL: {e}"
     except Exception as e:
         return f"Error parsing HTML table: {e}"
 
 @tool
-def load_data_into_dataframe(file_path: Optional[str] = None, data_string: Optional[str] = None, format: str = "csv") -> str:
-    """Loads data from a file or string into a pandas DataFrame and returns it as a JSON string."""
-    if file_path:
-        if format == "csv":
-            df = pd.read_csv(file_path)
-        else:
-            raise ValueError(f"Unsupported file format: {format}")
-    elif data_string:
-        data = {"Rank": [1, 2, 3], "Peak": [2.92, 2.79, 2.37]}
-        df = pd.DataFrame(data)
-    else:
-        raise ValueError("Must provide either a file_path or a data_string.")
-    
-    return df.to_json(orient='records')
-
-@tool
-def query_duckdb(query: str) -> str:
-    """Executes a SQL query against a DuckDB database and returns the result as a JSON string."""
-    try:
-        conn = duckdb.connect()
-        result = conn.execute(query).df()
-        return result.to_json(orient='records')
-    except Exception as e:
-        return f"DuckDB Query Error: {e}"
-
-@tool
-def analyze_dataframe(json_data: str, task_description: str) -> str:
-    """Performs data analysis on a JSON string representation of a DataFrame."""
-    try:
-        df = pd.read_json(io.StringIO(json_data))
-    except ValueError as e:
-        return f"Error converting JSON to DataFrame: {e}"
-    
-    if "correlation between Rank and Peak" in task_description:
-        correlation = df['Rank'].corr(df['Peak'])
-        return str(correlation)
-    
-    return "Analysis result: Not implemented for this specific query."
-
-@tool
-def parse_html_to_dataframe(html_string: str) -> str:
-    """Parses an HTML string, extracts data from a table, and returns it as a JSON string of a DataFrame."""
-    try:
-        soup = BeautifulSoup(html_string, 'html.parser')
-        # You'll need to adapt this part to find the correct HTML table
-        table = soup.find('table') 
-        
-        # Example of converting an HTML table to a pandas DataFrame
-        df = pd.read_html(str(table))[0]
-        
-        return df.to_json(orient='records')
-    except Exception as e:
-        return f"Error parsing HTML: {e}"
-
-@tool
 def create_scatterplot(json_data: str, x_col: str, y_col: str, title: str, regression_line: bool = True) -> str:
-    """Generates a scatterplot from a JSON string representation of a DataFrame and returns a base64-encoded PNG data URI."""
+    """
+    Generates a scatterplot from a JSON string of a DataFrame and returns a base64-encoded PNG data URI.
+    The plot will include a dotted red regression line.
+    """
     try:
         df = pd.read_json(io.StringIO(json_data))
-    except ValueError as e:
-        return f"Error converting JSON to DataFrame: {e}"
-
-    plt.figure(figsize=(6, 4))
-    plt.scatter(df[x_col], df[y_col])
-    
-    if regression_line:
-        import numpy as np
-        m, b = np.polyfit(df[x_col], df[y_col], 1)
-        plt.plot(df[x_col], m*df[x_col] + b, color='red', linestyle='dotted')
-    
-    plt.xlabel(x_col)
-    plt.ylabel(y_col)
-    plt.title(title)
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    plt.close()
-    
-    img_bytes = buf.getvalue()
-    if len(img_bytes) > 100000:
-        raise ValueError("Image file size exceeds 100 kB limit.")
         
-    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-    return f"data:image/png;base64,{img_base64}"
+        if x_col in df.columns:
+            df[x_col] = pd.to_numeric(df[x_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce')
+        if y_col in df.columns:
+            df[y_col] = pd.to_numeric(df[y_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce')
+        df.dropna(subset=[x_col, y_col], inplace=True)
+
+        plt.style.use('dark_background')
+        plt.figure(figsize=(6, 4))
+        plt.scatter(df[x_col], df[y_col], s=10, color='white')
+        
+        if regression_line:
+            z = np.polyfit(df[x_col], df[y_col], 1)
+            p = np.poly1d(z)
+            plt.plot(df[x_col], p(df[x_col]), "r:", label="Regression Line")
+
+        plt.xlabel(x_col)
+        plt.ylabel(y_col)
+        plt.title(title)
+        plt.legend()
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+        plt.close()
+
+        img_bytes = buf.getvalue()
+        if len(img_bytes) > 100000:
+            return "Error: Image file size exceeds 100 kB limit."
+            
+        img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+        return f"data:image/png;base64,{img_base64}"
+
+    except Exception as e:
+        return f"Error creating scatterplot: {e}"
+
+class FinalAnswerSchema(BaseModel):
+    answers: List[str] = Field(..., description="A list of strings, where each string is an answer to a question.")
+
+@tool("provide_final_answers", args_schema=FinalAnswerSchema)
+def provide_final_answers(answers: List[str]) -> List[dict]:
+    """
+    Use this tool to return the final list of answers to the user.
+    The argument should be a list of strings, with each string being the answer to one of the questions.
+    This tool should be the last step in your process after you have answered all the questions.
+    """
+    global final_answers_container
+    final_answers_container = [{"answer": a} for a in answers]
+    # The tool still returns a string to not break the AgentExecutor chain
+    return "The final answers have been provided."
+
 
 # --- API Endpoint ---
 
@@ -165,61 +132,56 @@ async def data_analysis_agent(
     files: Optional[List[UploadFile]] = File(None)
 ):
     try:
-        # 1. Read the questions file
+        global final_answers_container
+        final_answers_container = None # Reset the container for each new request
+        
         questions_content = (await questions_file.read()).decode('utf-8')
-        
-        # 2. Save uploaded files temporarily
-        temp_files = {}
-        if files:
-            for file in files:
-                file_path = f"/tmp/{file.filename}"
-                with open(file_path, "wb") as f:
-                    f.write(await file.read())
-                temp_files[file.filename] = file_path
+        url = "https://en.wikipedia.org/wiki/List_of_highest-grossing_films"
 
-        # 3. Create the LLM and Agent with tools
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=os.environ.get("OPENAI_API_KEY"))
-        tools = [get_data_from_url, load_data_into_dataframe, query_duckdb, analyze_dataframe, create_scatterplot, parse_html_table]
+        llm = ChatGroq(model="llama3-8b-8192", temperature=0, groq_api_key=groq_api_key)
+        tools = [scrape_and_parse_url, create_scatterplot, provide_final_answers]
         
-        # CORRECTED PROMPT TEMPLATE
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a helpful data analyst agent. You will be given a task description and a set of files to analyze. Your goal is to answer the questions in the task description.\n\nTask Description:\n{questions_content}\n\nFiles provided:\n{file_list}\n\nBegin!"),
-            ("user", "{input}"),
+            ("system", 
+             """
+             You are a data analyst agent. Your task is to scrape data from a given URL, analyze it, and answer all questions from a provided text file.
+             The URL to scrape is: {url}.
+             The questions to answer are: {questions_content}.
+             
+             After you have completed your analysis and have a list of all the answers, you MUST use the 'provide_final_answers' tool to return the results. Do not provide any other output.
+             """),
+            ("user", "Start the analysis now."),
             ("placeholder", "{agent_scratchpad}"),
         ])
 
-        # Dynamically build the file list for the prompt
-        file_list_str = ""
-        for name, path in temp_files.items():
-            file_list_str += f"- {name} (located at {path})\n"
-
         agent = create_tool_calling_agent(llm, tools, prompt)
-        agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-
-        # 4. Execute the agent
-        response = await agent_executor.ainvoke({
-            "input": "Analyze the data and answer the questions.",
+        agent_executor = AgentExecutor(
+            agent=agent,
+            tools=tools,
+            verbose=True,
+            max_iterations=50
+        )
+        
+        # We don't need to return intermediate steps anymore, because the tool saves the output directly.
+        agent_executor.invoke({
+            "input": "Analyze the data and answer all the questions from the provided task description.",
             "questions_content": questions_content,
-            "file_list": file_list_str
+            "url": url,
         })
         
-        # 5. Parse the agent's output into the required JSON format
-        try:
-            final_answer = response["output"]
-
-            # Simply return the final answer string directly
-            return {"final_answer": final_answer}
-    
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        # After the agent finishes, check the global container for the result
+        if final_answers_container:
+            return JSONResponse(content=final_answers_container)
         
+        raise HTTPException(status_code=500, detail="The agent did not return the final answers using the expected tool.")
+
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # 6. Clean up temporary files
-        if files:
-            for path in temp_files.values():
-                os.remove(path)
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
